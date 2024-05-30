@@ -1,0 +1,209 @@
+---
+title: "STA Project"
+author: "Amanda Duong"
+date: "2024-05-28"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+MI <- read.csv("~/Desktop/mammalianMI-main/data/MI.csv", sep = ";")
+```
+
+```{r}
+# Using the authors' custom functions dataset located in the GitHub
+# Load functions
+source("functions.R")
+# Uncomment install.packages function to install them 
+#install.packages('ggdist')
+#install.packages('ape')
+#install.packages('coin')
+#install.packages('doSNOW')
+#install.packages('ggplot2')
+#install.packages('nlme')
+#install.packages('patchwork')
+#install.packages('rphylopic')
+#install.packages('tidyr')
+#install.packages('spaMM')
+#install.packages('smatr')
+```
+```{r}
+# Make sure dependencies all work
+check_dependencies_all(c("ape", "coin", "doSNOW", "ggdist", "ggplot2", "nlme",
+                         "patchwork", "rphylopic", "smatr", "spaMM", "tidyr"))
+library(spaMM) # load spaMM and smatr dependencies
+library(smatr)
+```
+```{r}
+# Now we need to clean up the maternal investment (MI) dataset
+# load phylogenetic tree from the data
+run_slow <- FALSE
+tree <- ape::read.tree("data/RAxML_bipartitions.result_FIN4_raw_rooted_wBoots_4098mam1out_OK.newick")
+prepare_df_MIfull <- function(raw_df) {
+  
+  ## Rename column
+  raw_df$Key  <- raw_df$Name
+  raw_df$Name <- raw_df$Common.name
+  
+  ## Compute derived columns
+  ### Note: all masses are ultimately expressed in kg and duration in days
+  raw_df$Species <- paste(raw_df$Genus, raw_df$Species)
+  raw_df$Adult_mass   <- raw_df$Adult_mass_g/1000
+  raw_df$Male_adult_mass   <- raw_df$Male_adult_mass_g/1000
+  raw_df$Female_adult_mass   <- raw_df$Female_adult_mass_g/1000
+  raw_df$Weaning_mass <- raw_df$Weaning_mass_g/1000
+  raw_df$Litter_mass <- raw_df$Weaning_mass*raw_df$Litter.Clutch.size
+  raw_df$Investment_duration <- raw_df$Gestation_days + raw_df$Lactation_days
+  raw_df$Adult_mass_log10 <- log(raw_df$Adult_mass, base = 10)
+  raw_df$Male_adult_mass_log10 <- log(raw_df$Male_adult_mass, base = 10)
+  raw_df$Female_adult_mass_log10 <- log(raw_df$Female_adult_mass, base = 10)
+  raw_df$Litter_mass_log10 <- log(raw_df$Litter_mass, base = 10)
+  raw_df$Investment_duration_log10 <-  log(raw_df$Investment_duration, base = 10)
+  raw_df$Lifespan <- raw_df$Maximum_longevity_y * 365.25
+  raw_df$Lifespan_log10 <- log(raw_df$Lifespan, base = 10)
+  
+  ## Format character-columns into factors
+  raw_df$Subclass <- as.factor(raw_df$Subclass)
+  raw_df$Order    <- as.factor(raw_df$Order)
+  raw_df$Key      <- as.factor(raw_df$Key)
+  raw_df$Name     <- as.factor(raw_df$Name)
+  
+  ## Drop row for which critical information is missing
+  raw_df <- raw_df[!is.na(raw_df$Litter_mass) & !is.na(raw_df$Adult_mass), ]
+  
+  ## Remove species for which the offspring are more than 15% heavier than the adult mass
+  too_big <- raw_df$Weaning_mass_g > 1.15*raw_df$Adult_mass_g
+    if (length(too_big) > 0) {
+      message(paste("The following", sum(too_big),  "species have been discarded since the offspring are, at weaning age, more than 15% heavier than adults:"))
+      message(paste(raw_df$Name[too_big], collapse = "\n"))
+    }
+  
+  raw_df <- raw_df[!too_big, ]
+  
+  ## Remove species for which the adult default mass is more than 15% heavier than the heaviest adult sex
+  too_big2 <- !is.na(raw_df$Male_adult_mass) & !is.na(raw_df$Female_adult_mass) & 1.15*pmax(raw_df$Male_adult_mass, raw_df$Female_adult_mass) < raw_df$Adult_mass
+  
+  if (length(too_big2) > 0) {
+    message(paste("\nThe following", sum(too_big2),  "species have been discarded since the default adult mass was more than 15% heavier than the heaviest sex in adults:"))
+    message(paste(raw_df$Name[too_big2], collapse = "\n"))
+  }
+  
+  raw_df <- raw_df[!too_big2, ]
+  
+  ## Remove species for which the adult default mass is more than 15% lighter than the lighter adult sex
+  too_small <- !is.na(raw_df$Male_adult_mass) & !is.na(raw_df$Female_adult_mass) & 0.85*pmin(raw_df$Male_adult_mass, raw_df$Female_adult_mass) > raw_df$Adult_mass
+  
+  if (length(too_small) > 0) {
+    message(paste("\nThe following", sum(too_small),  "species have been discarded since the default adult mass was more than 15% lighter than the lightest sex in adults:"))
+    message(paste(raw_df$Name[too_small], collapse = "\n"))
+  }
+  
+  raw_df <- raw_df[!too_small, ]
+
+  ## Reorder and select columns
+  raw_df <- raw_df[, c("Species", "Key", "Subclass", "Family", "Order", "Name",
+                       "Adult_mass", "Adult_mass_log10",
+                       "Male_adult_mass", "Male_adult_mass_log10",
+                       "Female_adult_mass", "Female_adult_mass_log10",
+                       "Litter_mass", "Litter_mass_log10",
+                       "Investment_duration", "Investment_duration_log10",
+                       "Lifespan", "Lifespan_log10")]
+  
+  ## Final cleaning
+  raw_df <- droplevels(raw_df)
+  rownames(raw_df) <- NULL
+  
+  raw_df
+}
+```
+
+#Preparation and SubClasses
+```{r}
+MI_full <- prepare_df_MIfull(MI_raw)
+nrow(MI_full) # 1041
+
+### Prepare subsample with for comparison between subclasses
+MI_subclasses <- droplevels(MI_full[!is.na(MI_full$Investment_duration) & MI_full$Key %in% tree[["tip.label"]], ])
+nrow(MI_subclasses) # 738
+str(MI_subclasses)
+
+### Prepare subsample without dropping species without investment duration
+MI_subclasses_noD <- droplevels(MI_full[MI_full$Key %in% tree[["tip.label"]], ])
+nrow(MI_subclasses_noD) # 801
+str(MI_subclasses_noD)
+
+### Prepare subsample for the comparison between orders
+MI_orders <- prepare_df_MIfull.orders(MI_subclasses)
+nrow(MI_orders) # 699
+str(MI_orders)
+
+#### Prepare subsample for the comparison between orders solely including Eutheria
+MI_orders_euth <- droplevels(MI_orders[MI_orders$Subclass == "Eutheria", ])
+nrow(MI_orders_euth)
+# [1] 632
+
+#### Prepare subsample for the comparison between orders solely including Metatheria
+MI_orders_meta <- droplevels(MI_orders[MI_orders$Subclass == "Metatheria", ])
+nrow(MI_orders_meta)
+# [1] 67
+
+### Prepare subsample with no missing data for modelling 
+MI_models <- MI_subclasses
+nrow(MI_models) # 738
+str(MI_models)
+```
+
+
+```{r}
+#Functions
+draw_figure_1 <- function(data_models, fit_SLR, fit_PLMM, fit_SMA) {
+  
+  data_pred <- data.frame(Adult_mass = c(0.001, 1e6),
+                          Adult_mass_log10 = log(c(0.001, 1e6), base = 10),
+                          Investment_duration_log10 = mean(data_models$Investment_duration_log10))
+  data_pred$SLR   <- 10^(predict(fit_SLR, newdata = data_pred)[, 1])
+  data_pred$PLMM  <- 10^(predict(fit_PLMM, newdata = data_pred, re.form = NA)[, 1])
+  data_pred$SMA   <- 10^as.numeric(as.matrix(cbind(1, data_pred[, "Adult_mass_log10", drop = FALSE])) %*% matrix(coef(fit_SMA)))
+  
+  data_pred <- tidyr::pivot_longer(data_pred, cols = SLR:MPLMM, names_to = "Model", values_to = "Predict")
+  data_pred$Model <- factor(data_pred$Model, levels = c("SLR", "PLMM", "SMA"))
+  
+  fig <- ggplot2::ggplot(data = data_models, ggplot2::aes(Adult_mass, Litter_mass)) + 
+    ggplot2::scale_x_continuous(trans = "log10", breaks = c(0.1, 1, 10, 100, 1000, 10000, 100000),
+                                labels = c("0.1", "1", "10", "100", "1000", "10,000", "100,000"),
+                                expand = c(0, 0)) + 
+    ggplot2::scale_y_continuous(trans = "log10",
+                                breaks = c(0.1, 1, 10, 100, 1000, 10000),
+                                labels = c("0.1", "1", "10", "100", "1000", "10,000"),
+                                expand = c(0, 0)) +
+    ggplot2::scale_shape_manual(values = 21:23) +
+    ggplot2::scale_fill_manual(values = c("steelblue", "darkred", "#FCC501")) +
+    ggplot2::scale_color_viridis_d(option = "H", end = 0.8) +
+    ggplot2::geom_point(ggplot2::aes(shape = Subclass, fill = Subclass), alpha = 0.7, size = 2) +
+    ggplot2::geom_line(ggplot2::aes(y = Predict, x = Adult_mass, colour = Model), data = data_pred,
+                       linewidth = 0.7, alpha = 0.8, inherit.aes = FALSE) +
+    ggplot2::labs(x = 'Adult mass (kg)', y = 'Litter mass at weaning age (kg)') +
+    ggplot2::theme_classic() +
+    ggplot2::theme(legend.position = "right")
+    
+    print(fig)
+}
+```
+### SMA Model Code
+```{r}
+# Fitting SMA model to compare methods
+# Already loaded MI data set
+fit_SMA <- sma(Litter_mass_log10 ~ Adult_mass_log10, data = MI_models, method = "SMA")
+### Checking SMA model assumptions
+plot(fit_SMA, which = "default") ## default diagnostics (good!)
+plot(fit_SMA, which = "residual") ## residual diagnostics (good!)
+plot(fit_SMA, which = "qq") ## qq diagnostics (ok)
+### Find CI for estimates in SMA model
+pretty(extract_fit_summary(fit_SMA))
+### Computing R2 in SMA model
+compure_r2(fit_SMA)
+```
+
